@@ -11,6 +11,19 @@ CHANGES (v3.1):
   - tpis_final = 0.8 * tpis + 0.2 * water_score  (soft blend, not multiply)
     Zero water access degrades the score but does not zero it out.
   - tpis_final is saved alongside tpis so Stage 6 uses it directly.
+
+CHANGES (v3.2):
+  - compute_zonal_stats() no longer accepts or uses seg_mask.
+    canopy_pct / bare_pct / built_pct REMOVED (came from segmentation).
+  - Now accepts plantability_map (H, W float32 ∈ [0,1]) from Stage 3.
+  - New zonal features derived from plantability_map:
+      mean_plantability   — mean plantability score within polygon
+      high_potential_area — m² where plantability > 0.6
+      plantable_area      — same as high_potential_area (alias for Stage 5)
+      trees_possible      — floor(plantable_area / tree_spacing_m2)
+  - compute_tpis() updated: canopy_def_norm replaced by mean_plantability_norm.
+    canopy_deficit / canopy_def_norm columns removed.
+  - run_data_fusion() signature: seg_mask → plantability_map.
 """
 
 import logging
@@ -38,7 +51,7 @@ except ImportError:
     zonal_stats = None
 
 from config.settings import (
-    TPIS_WEIGHTS, TARGET_CANOPY_PCT, ECOSYSTEM_VALUES,
+    TPIS_WEIGHTS, ECOSYSTEM_VALUES,
     SOCIO_DATA_PATH, WATER_FILTER_PARAMS, setup_logging,
 )
 
@@ -68,109 +81,164 @@ def compute_zonal_stats(
     polygons: "gpd.GeoDataFrame",
     ndvi: np.ndarray,
     lst: np.ndarray,
-    seg_mask: np.ndarray,
+    plantability_map: np.ndarray,
     raster_meta: dict,
 ) -> "gpd.GeoDataFrame":
     """
     Compute per-polygon zonal statistics.
 
+    v3.2: seg_mask removed.  plantability_map (from Stage 3 Plantability
+    Engine) drives all land-suitability metrics.
+
     Metrics per polygon:
-      - canopy_pct: % pixels classified as canopy (class 0)
-      - bare_pct: % pixels classified as bare land (class 2)
-      - mean_ndvi: mean NDVI within polygon
-      - mean_lst: mean LST within polygon
-      - lst_anomaly: mean_lst - city_mean_lst
-      - plantable_area: bare_pct × area_m²
-      - trees_possible: floor(plantable_area / tree_spacing_m2)
+      - mean_plantability:   mean plantability score within polygon ∈ [0,1]
+      - high_potential_area: m² of pixels with plantability > 0.6
+      - plantable_area:      alias for high_potential_area (used by Stage 5)
+      - trees_possible:      floor(plantable_area / tree_spacing_m2)
+      - mean_ndvi:           mean NDVI within polygon
+      - mean_lst:            mean LST within polygon
+      - lst_anomaly:         mean_lst − city_mean_lst
 
     Args:
-        polygons: GeoDataFrame with zone geometries.
-        ndvi: NDVI raster array.
-        lst: LST raster array.
-        seg_mask: Segmentation mask {0:Canopy, 1:Built, 2:Bare}.
-        raster_meta: Raster metadata with transform/CRS info.
+        polygons:         GeoDataFrame with zone geometries.
+        ndvi:             NDVI raster array  (H, W).
+        lst:              LST  raster array  (H, W) — may differ in resolution.
+        plantability_map: Plantability raster (H, W) float32 ∈ [0, 1].
+        raster_meta:      Raster metadata with transform / CRS info.
 
     Returns:
         GeoDataFrame with zonal stats columns added.
     """
     logger.info(f"Computing zonal stats for {len(polygons)} polygons")
 
+   
     gdf = polygons.copy()
     transform = raster_meta.get("transform")
     crs = raster_meta.get("crs")
+
+    if transform is None:
+        raise ValueError("raster_meta missing transform — cannot compute zonal stats")
+
 
     if crs and hasattr(gdf, 'crs') and gdf.crs:
         if str(gdf.crs) != str(crs):
             gdf = gdf.to_crs(crs)
 
+    # Pixel area in m² (derived from the raster transform)
+    pixel_area_m2 = 1.0
+    if transform is not None:
+        try:
+            pixel_area_m2 = abs(transform.a * transform.e)   # |dx| × |dy|
+        except Exception:
+            pixel_area_m2 = 100.0   # fallback: assume 10 m × 10 m pixels
+
     results = {
-        "canopy_pct": [], "bare_pct": [], "built_pct": [],
-        "mean_ndvi": [], "mean_lst": [], "lst_anomaly": [],
-        "plantable_area": [], "trees_possible": [],
-        "area_m2": [], "pop_density": [],
+        "mean_plantability": [],
+        "high_potential_area": [],
+        "plantable_area": [],
+        "trees_possible": [],
+        "mean_ndvi": [],
+        "mean_lst": [],
+        "lst_anomaly": [],
+        "area_m2": [],
+        "pop_density": [],
     }
 
     city_mean_lst = float(np.nanmean(lst))
+
+    # Align LST to plantability_map shape if needed
+    ref_shape = plantability_map.shape
+    if lst.shape != ref_shape:
+        from scipy.ndimage import zoom
+        lst_aligned = zoom(
+            lst.astype(np.float32),
+            (ref_shape[0] / lst.shape[0], ref_shape[1] / lst.shape[1]),
+            order=1,
+        )
+    else:
+        lst_aligned = lst
+
+    # Align NDVI similarly
+    if ndvi.shape != ref_shape:
+        from scipy.ndimage import zoom as _zoom
+        ndvi_aligned = _zoom(
+            ndvi.astype(np.float32),
+            (ref_shape[0] / ndvi.shape[0], ref_shape[1] / ndvi.shape[1]),
+            order=1,
+        )
+    else:
+        ndvi_aligned = ndvi
 
     for idx, row in gdf.iterrows():
         geom = row.geometry
 
         try:
+            # --- Create mask ---
             mask = geometry_mask(
-                [geom], out_shape=seg_mask.shape,
-                transform=transform, invert=True
+                [geom],
+                out_shape=ref_shape,
+                transform=transform,
+                invert=True,
             )
 
-            seg_px = seg_mask[mask]
-            ndvi_px = ndvi[mask] if ndvi.shape == seg_mask.shape else ndvi.ravel()[:len(seg_px)]
+            # --- Extract pixel values ---
+            plant_px = plantability_map[mask]
+            ndvi_px  = ndvi_aligned[mask]
+            lst_px   = lst_aligned[mask]
 
-            if lst.shape != seg_mask.shape:
-                from scipy.ndimage import zoom
-                lst_resized = zoom(lst,
-                    (seg_mask.shape[0] / lst.shape[0], seg_mask.shape[1] / lst.shape[1]),
-                    order=1)
-                lst_px = lst_resized[mask]
-            else:
-                lst_px = lst[mask]
+            # --- Handle empty ---
+            if plant_px.size == 0:
+                raise ValueError("Empty mask")
 
-            total_px = max(len(seg_px), 1)
-            canopy_pct = np.sum(seg_px == 0) / total_px * 100
-            bare_pct   = np.sum(seg_px == 2) / total_px * 100
-            built_pct  = np.sum(seg_px == 1) / total_px * 100
+            # --- Compute stats ---
+            mean_plant = float(np.nanmean(plant_px)) if np.any(~np.isnan(plant_px)) else 0.0
+            mean_ndvi_val = float(np.nanmean(ndvi_px)) if np.any(~np.isnan(ndvi_px)) else 0.0
+            mean_lst_val  = float(np.nanmean(lst_px)) if np.any(~np.isnan(lst_px)) else 0.0
 
-            mean_ndvi_val = float(np.nanmean(ndvi_px)) if len(ndvi_px) > 0 else 0
-            mean_lst_val  = float(np.nanmean(lst_px))  if len(lst_px)  > 0 else city_mean_lst
-
-            area_m2 = geom.area
-            if area_m2 < 1:
+            # --- Area calculation ---
+            if gdf.crs and "4326" in str(gdf.crs):
                 centroid = geom.centroid
                 area_m2 = geom.area * (111320 ** 2) * np.cos(np.radians(centroid.y))
+            else:
+                area_m2 = geom.area
 
-            plantable = bare_pct / 100.0 * area_m2
-            trees = int(plantable / ECOSYSTEM_VALUES["tree_spacing_m2"])
+            # --- Plantability → area ---
+            plantable_area = mean_plant * area_m2
+
+            # --- Tree estimation ---
+            spacing = ECOSYSTEM_VALUES["tree_spacing_m2"]
+            trees = int(plantable_area / spacing) if spacing > 0 else 0
+
+            # --- Safety floor ---
+            if plantable_area > 0 and trees == 0:
+                trees = 1
 
         except Exception as e:
             logger.warning(f"Zonal stats failed for polygon {idx}: {e}")
-            canopy_pct = bare_pct = built_pct = 0
-            mean_ndvi_val = mean_lst_val = 0
-            area_m2 = plantable = 0
+
+            mean_plant = 0.0
+            mean_ndvi_val = 0.0
+            mean_lst_val = 0.0
+            plantable_area = 0.0
+            area_m2 = 0.0
             trees = 0
 
-        results["canopy_pct"].append(canopy_pct)
-        results["bare_pct"].append(bare_pct)
-        results["built_pct"].append(built_pct)
+        results["mean_plantability"].append(mean_plant)
+        results["high_potential_area"].append(plantable_area)
+        results["plantable_area"].append(plantable_area)
+        results["trees_possible"].append(trees)
         results["mean_ndvi"].append(mean_ndvi_val)
         results["mean_lst"].append(mean_lst_val)
         results["lst_anomaly"].append(mean_lst_val - city_mean_lst)
         results["area_m2"].append(area_m2)
-        results["plantable_area"].append(plantable)
-        results["trees_possible"].append(trees)
-        results["pop_density"].append(0)  # placeholder — from WorldPop
+        results["pop_density"].append(0)   # placeholder — from WorldPop
 
     for key, vals in results.items():
         gdf[key] = vals
 
-    logger.info(f"Zonal stats computed. Total plantable trees: {sum(results['trees_possible'])}")
+    logger.info(
+        f"Zonal stats computed. Total plantable trees: {sum(results['trees_possible'])}"
+    )
     return gdf
 
 
@@ -333,10 +401,16 @@ def compute_tpis(
     """
     Compute Tree Planting Impact Score (TPIS) per zone.
 
-    TPIS = w1*canopy_def_norm + w2*thermal_stress + w3*vuln_score
+    TPIS = w1*mean_plantability_norm + w2*thermal_stress + w3*vuln_score
            + w4*plantability + w5*roi_norm
 
     Range: [0, 1].  Weights are user-adjustable via config.
+
+    v3.2 change:
+      canopy_def_norm (derived from seg_mask canopy_pct) is replaced by
+      mean_plantability_norm (derived from the plantability raster).
+      The TPIS_WEIGHTS key "canopy_deficit" is reused for continuity so
+      config files do not need to change.
 
     NOTE: This is the raw TPIS (without water).  The water-aware
     final score is computed in compute_tpis_final() below.
@@ -345,10 +419,11 @@ def compute_tpis(
 
     w = weights or TPIS_WEIGHTS
 
-    canopy_deficit = np.maximum(0, TARGET_CANOPY_PCT - gdf["canopy_pct"].values / 100.0)
-    max_deficit = np.max(canopy_deficit) if np.max(canopy_deficit) > 0 else 1
-    gdf["canopy_deficit"]   = canopy_deficit
-    gdf["canopy_def_norm"]  = canopy_deficit / max_deficit
+    # v3.2: plantability replaces canopy deficit as the land-suitability signal.
+    # Higher mean_plantability → zone has more high-quality plantable land.
+    plant_vals = gdf["mean_plantability"].values
+    max_plant  = np.max(plant_vals) if np.max(plant_vals) > 0 else 1
+    gdf["mean_plantability_norm"] = plant_vals / max_plant   # already in [0,1], but normalize across zones
 
     lst_vals = gdf["mean_lst"].values
     lst_min, lst_max = np.min(lst_vals), np.max(lst_vals)
@@ -360,7 +435,7 @@ def compute_tpis(
     gdf["plantability"] = trees / max_trees
 
     tpis = (
-        w["canopy_deficit"]  * gdf["canopy_def_norm"].values
+        w["canopy_deficit"]  * gdf["mean_plantability_norm"].values   # reuses weight key
         + w["thermal_stress"]  * gdf["thermal_stress"].values
         + w["vulnerability"]   * gdf["vuln_score"].values
         + w["plantability"]    * gdf["plantability"].values
@@ -419,7 +494,7 @@ def run_data_fusion(
     polygons: "gpd.GeoDataFrame",
     ndvi: np.ndarray,
     lst: np.ndarray,
-    seg_mask: np.ndarray,
+    plantability_map: np.ndarray,
     raster_meta: dict,
     weights: Optional[Dict[str, float]] = None,
     poverty_raster: Optional[np.ndarray] = None,
@@ -431,7 +506,12 @@ def run_data_fusion(
     """
     Run complete Stage 4: Impact Score Fusion.
 
-    New parameter vs v3.0:
+    v3.2 change:
+        seg_mask parameter removed and replaced with plantability_map.
+        compute_zonal_stats() now derives plantable_area and trees_possible
+        from the plantability raster instead of segmentation class counts.
+
+    v3.1 note (unchanged):
         water_gdf — optional water network GeoDataFrame passed in from
                     the pipeline runner so that water_score is computed
                     here, before ranking, fixing the Rank-Then-Filter flaw.
@@ -447,13 +527,13 @@ def run_data_fusion(
     out_dir = Path(output_dir) if output_dir else Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gdf = compute_zonal_stats(polygons, ndvi, lst, seg_mask, raster_meta)
+    gdf = compute_zonal_stats(polygons, ndvi, lst, plantability_map, raster_meta)
     gdf = compute_vulnerability(gdf, poverty_raster, no2_raster,
                                 dependency_raster, raster_meta)
     gdf = compute_ecosystem_roi(gdf)
     gdf = compute_tpis(gdf, weights)
 
-    # ── NEW: water score computed here so ranking is feasibility-aware ──
+    # ── water score computed here so ranking is feasibility-aware ──
     gdf = compute_water_score(gdf, water_gdf=water_gdf)
     gdf = compute_tpis_final(gdf)
 

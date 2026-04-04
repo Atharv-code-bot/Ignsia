@@ -16,6 +16,17 @@ CHANGES (v3.1):
 
   - Stage 6 (knapsack_optimize) receives all feasible zones and uses
     tpis_final automatically.
+
+CHANGES (v3.2):
+  - Stage 3 replaced: run_stage3_segmentation() → run_stage3_plantability().
+    Imports from plantability.py instead of segmentation_model.py.
+    No ML model required — fully deterministic Sentinel-2-native computation.
+
+  - run_stage4_fusion() call updated: seg_mask= → plantability_map=.
+    Stage 4 (data_fusion.py) no longer accepts or uses seg_mask.
+
+  - run_stage3_segmentation() retained as a deprecated alias pointing to
+    run_stage3_plantability() to avoid breaking external callers.
 """
 
 import json
@@ -131,16 +142,46 @@ class TEORAPipeline:
             output_dir=str(self.output_dir / "indices"),
         )
 
-    def run_stage3_segmentation(self, s2_bands, meta) -> Dict:
-        """Stage 3: Land Cover Segmentation (RGB)."""
-        from segmentation_model import run_segmentation_pipeline
+    def run_stage3_plantability(self, indices: Dict, meta: dict) -> Dict:
+        """
+        Stage 3: Plantability Engine (replaces RGB segmentation model).
+
+        Consumes indices already computed by Stage 2 — no ML model, no
+        domain-mismatch risk, fully deterministic and Sentinel-2-native.
+
+        Args:
+            indices: Dict returned by run_stage2_indices() — must contain
+                     keys: ndvi, ndbi, lst  (and optionally ndwi, bsi).
+            meta:    Rasterio metadata dict (s2_meta from Stage 2).
+        """
+        from plantability import run_plantability_pipeline
         return self._time_stage(
-            "Stage 3: Segmentation (RGB)",
-            run_segmentation_pipeline,
-            s2_bands=s2_bands,
-            output_dir=str(self.output_dir / "segmentation"),
+            "Stage 3: Plantability Engine",
+            run_plantability_pipeline,
+            ndvi=indices["ndvi"],
+            ndbi=indices["ndbi"],
+            lst=indices.get("lst_sharpened", indices["lst"]),
+            ndwi=indices.get("ndwi"),
+            bsi=indices.get("bsi"),
             raster_meta=meta,
+            output_dir=str(self.output_dir / "plantability"),
         )
+
+    def run_stage3_segmentation(self, s2_bands: Dict, meta: dict) -> Dict:
+        """
+        Deprecated alias → run_stage3_plantability().
+
+        Retained so any external code calling run_stage3_segmentation()
+        continues to work.  The s2_bands argument is ignored — indices are
+        pulled from the Stage 2 results stored in self.stage_results.
+        """
+        logger.warning(
+            "run_stage3_segmentation() is deprecated in v3.2. "
+            "Redirecting to run_stage3_plantability(). "
+            "Update callers to use run_stage3_plantability() directly."
+        )
+        indices = self.stage_results.get("indices", {})
+        return self.run_stage3_plantability(indices, meta)
 
     def run_stage3_5_land_rights(self, zones) -> Any:
         """Stage 3.5: Land Rights & Protected Area Validation."""
@@ -176,12 +217,16 @@ class TEORAPipeline:
         polygons,
         ndvi,
         lst,
-        seg_mask,
+        plantability_map,
         meta,
-        water_gdf=None,          # ← NEW: passed in from pipeline
+        water_gdf=None,
     ) -> Any:
         """
         Stage 4: Impact Score Fusion (TPIS + water_score → tpis_final).
+
+        v3.2: accepts plantability_map (from Stage 3 Plantability Engine)
+        instead of seg_mask.  Stage 4 derives plantable_area and
+        trees_possible directly from the plantability raster.
 
         water_gdf is loaded by run_full_pipeline() and passed here so
         that water_score is computed BEFORE ranking — fixing the
@@ -194,10 +239,10 @@ class TEORAPipeline:
             polygons=polygons,
             ndvi=ndvi,
             lst=lst,
-            seg_mask=seg_mask,
+            plantability_map=plantability_map,
             raster_meta=meta,
             weights=self.weights,
-            water_gdf=water_gdf,          # ← passed through
+            water_gdf=water_gdf,
             output_dir=str(self.output_dir / "fusion"),
         )
 
@@ -227,7 +272,7 @@ class TEORAPipeline:
             "Stage 6: Knapsack Optimization",
             knapsack_optimize,
             feasible_zones=feasible_zones,
-            max_trees=self.max_trees,
+            budget_rupees=self.max_trees,   # 🔥 TEMP MAPPING
         )
 
     def run_stage7_anomaly(self, zones) -> Any:
@@ -272,12 +317,12 @@ class TEORAPipeline:
         s2 = self.run_stage2_indices(s1["s2_path"], s1["thermal_path"])
         self.stage_results["indices"] = s2
 
-        # ── Stage 3 ────────────────────────────────────────────
-        s3 = self.run_stage3_segmentation(
-            s2_bands={"B4": s2["B4"], "B3": s2["B3"], "B2": s2["B2"]},
+        # ── Stage 3 (Plantability Engine — replaces segmentation) ─
+        s3 = self.run_stage3_plantability(
+            indices=s2,
             meta=s2["s2_meta"],
         )
-        self.stage_results["segmentation"] = s3
+        self.stage_results["plantability"] = s3
 
         # ── Load water network BEFORE Stage 4 ──────────────────
         # Water GDF is now consumed by Stage 4 (not Stage 5) so that
@@ -299,9 +344,9 @@ class TEORAPipeline:
             polygons=neighborhoods,
             ndvi=s2["ndvi"],
             lst=s2.get("lst_sharpened", s2["lst"]),
-            seg_mask=s3["seg_mask"],
+            plantability_map=s3["plantability_map"],
             meta=s2["s2_meta"],
-            water_gdf=water_gdf,          # ← key change
+            water_gdf=water_gdf,
         )
         self.stage_results["fusion"] = s4
 
@@ -446,7 +491,7 @@ if __name__ == "__main__":
             neighborhoods_geojson=args.neighborhoods,
             start_date=args.start_date,
             end_date=args.end_date,
-            max_trees=args.max_trees,
+            max_budget=args.max_budget,
             output_dir=args.output_dir,
         )
         result = pipeline.run_full_pipeline()
