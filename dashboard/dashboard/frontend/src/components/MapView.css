@@ -1,0 +1,74 @@
+.mapview-wrapper {
+  position: relative;
+  height: 100%;
+  width: 100%;
+}
+
+.map-legend {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  z-index: 1000;
+  padding: 14px 18px;
+  min-width: 180px;
+}
+
+.legend-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.legend-gradient {
+  margin-bottom: 10px;
+}
+
+.legend-bar {
+  height: 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+
+.legend-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.legend-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: transparent;
+  flex-shrink: 0;
+}
+
+.custom-tooltip {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-lg) !important;
+  color: var(--text-primary) !important;
+  padding: 8px 12px !important;
+}
+
+.custom-tooltip::before {
+  border-top-color: var(--bg-card) !important;
+}
