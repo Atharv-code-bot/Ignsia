@@ -1,213 +1,214 @@
 """
-TEORA v3.0 — Stage 6: Multi-Constraint Knapsack Optimization
-==============================================================
-0/1 Knapsack using Google OR-Tools CP-SAT solver.
-Maximizes total tree planting impact under budget constraints.
-Includes Pareto budget sweep for efficiency frontier.
+TEORA v3.0 — Stage 2: Environmental Index Computation
+=======================================================
+Computes NDVI, NDBI, NDWI, BSI, LST from multi-band rasters.
+Includes XGBoost TsHARP thermal sharpening (100m → 10m).
 """
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 try:
-    from ortools.sat.python import cp_model
+    import rasterio
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject, Resampling
 except ImportError:
-    cp_model = None
+    rasterio = None
 
 try:
-    import geopandas as gpd
+    from sklearn.model_selection import GroupKFold
+    from xgboost import XGBRegressor
 except ImportError:
-    gpd = None
+    XGBRegressor = None
 
-from config.settings import MAX_TREES, OPTIMIZER_PARAMS, setup_logging
+from config.settings import LANDSAT_THERMAL, setup_logging
 
-logger = setup_logging("teora.optimizer")
+logger = setup_logging("teora.env_indices")
+
+EPSILON = 1e-10
 
 
-def knapsack_optimize(
-    feasible_zones: "gpd.GeoDataFrame",
-    max_trees: int = None,
-    timeout_sec: float = None,
-) -> Dict[str, Any]:
-    """
-    Multi-constraint 0/1 Knapsack optimization using CP-SAT.
+def _normalized_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    num = (a.astype(np.float32) - b.astype(np.float32))
+    den = (a.astype(np.float32) + b.astype(np.float32) + EPSILON)
+    return np.clip(num / den, -1.0, 1.0)
 
-    Objective: Maximize Σ (TPIS_i × trees_possible_i × x_i)
-    Constraint: Σ (trees_possible_i × x_i) ≤ T_max
 
-    Args:
-        feasible_zones: GeoDataFrame of feasible zones with TPIS.
-        max_trees: Maximum total trees budget constraint.
-        timeout_sec: Solver timeout in seconds.
+def compute_ndvi(b8: np.ndarray, b4: np.ndarray) -> np.ndarray:
+    return _normalized_diff(b8, b4)
 
-    Returns:
-        Dict with selected zones, total impact, budget utilization.
-    """
-    logger.info("=" * 60)
-    logger.info("STAGE 6: KNAPSACK OPTIMIZATION")
-    logger.info("=" * 60)
 
-    T_max = max_trees or MAX_TREES
-    timeout = timeout_sec or OPTIMIZER_PARAMS["solver_timeout_sec"]
-    scaling = OPTIMIZER_PARAMS["integer_scaling"]
+def compute_ndbi(b11: np.ndarray, b8: np.ndarray) -> np.ndarray:
+    return _normalized_diff(b11, b8)
 
-    if cp_model is None:
-        logger.warning("OR-Tools not installed — using greedy fallback")
-        return _greedy_fallback(feasible_zones, T_max)
 
-    N = len(feasible_zones)
-    if N == 0:
-        logger.warning("No feasible zones to optimize")
-        return {"selected": [], "total_impact": 0, "total_trees": 0}
+def compute_ndwi(b3: np.ndarray, b8: np.ndarray) -> np.ndarray:
+    return _normalized_diff(b3, b8)
 
-    logger.info(f"Optimizing {N} zones with budget T_max={T_max} trees")
 
-    # Prepare data
-    zones = feasible_zones.reset_index(drop=True)
-    tpis_vals = zones["tpis"].values
-    trees_vals = zones["trees_possible"].values.astype(int)
+def compute_bsi(b11: np.ndarray, b4: np.ndarray,
+                b8: np.ndarray, b2: np.ndarray) -> np.ndarray:
+    num = (b11.astype(np.float32) + b4.astype(np.float32) -
+           b8.astype(np.float32) - b2.astype(np.float32))
+    den = (b11.astype(np.float32) + b4.astype(np.float32) +
+           b8.astype(np.float32) + b2.astype(np.float32) + EPSILON)
+    return np.clip(num / den, -1.0, 1.0)
 
-    # Integer-scaled value: TPIS × trees_possible × 1000
-    values = (tpis_vals * trees_vals * scaling).astype(int)
 
-    # Build CP-SAT model
-    model_cp = cp_model.CpModel()
-    x = [model_cp.NewBoolVar(f"x_{i}") for i in range(N)]
+def compute_lst(st_b10: np.ndarray, ndvi: np.ndarray) -> np.ndarray:
+    logger.info("Computing LST from Landsat thermal")
 
-    # Maximize total impact
-    model_cp.Maximize(
-        cp_model.LinearExpr.WeightedSum(x, values.tolist())
-    )
+    thermal = st_b10.astype(np.float64)
+    bt_k = thermal * LANDSAT_THERMAL["scale_factor"] + LANDSAT_THERMAL["offset"]
 
-    # Budget constraint
-    model_cp.Add(
-        cp_model.LinearExpr.WeightedSum(x, trees_vals.tolist()) <= T_max
-    )
+    ndvi_resized = ndvi
+    if ndvi.shape != thermal.shape:
+        from scipy.ndimage import zoom
+        zoom_factors = (thermal.shape[0] / ndvi.shape[0],
+                        thermal.shape[1] / ndvi.shape[1])
+        ndvi_resized = zoom(ndvi, zoom_factors, order=1)
 
-    # Solve
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = timeout
-    solver.parameters.num_search_workers = 4
+    ndvi_min = np.nanmin(ndvi_resized)
+    ndvi_max = np.nanmax(ndvi_resized)
+    ndvi_range = ndvi_max - ndvi_min + EPSILON
+    pv = ((ndvi_resized - ndvi_min) / ndvi_range) ** 2
 
-    logger.info(f"Solving CP-SAT (timeout={timeout}s)...")
-    status = solver.Solve(model_cp)
+    emissivity = 0.004 * pv + 0.986
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        selected_idx = [i for i in range(N) if solver.Value(x[i]) == 1]
-        total_impact = solver.ObjectiveValue() / scaling
-        total_trees = sum(trees_vals[i] for i in selected_idx)
-        utilization = total_trees / T_max * 100
+    lam = LANDSAT_THERMAL["lambda_um"]
+    rho = LANDSAT_THERMAL["rho"]
+    ln_e = np.log(emissivity + EPSILON)
+    lst = bt_k / (1 + (lam * bt_k / rho) * ln_e)
 
-        status_str = "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE"
-        logger.info(f"Solution: {status_str}")
-        logger.info(f"Selected {len(selected_idx)}/{N} zones")
-        logger.info(f"Total trees: {total_trees}/{T_max} ({utilization:.1f}% budget)")
-        logger.info(f"Total impact: {total_impact:.2f}")
+    return (lst - 273.15).astype(np.float32)
 
-        # Mark selected zones
-        zones["selected"] = False
-        zones.loc[selected_idx, "selected"] = True
-        zones["knapsack_rank"] = 0
-        zones.loc[selected_idx, "knapsack_rank"] = range(1, len(selected_idx) + 1)
 
-        return {
-            "zones": zones,
-            "selected_indices": selected_idx,
-            "total_impact": total_impact,
-            "total_trees": total_trees,
-            "budget_utilization": utilization,
-            "status": status_str,
-        }
+class ThermalSharpener:
+    def __init__(self, n_estimators=300, max_depth=6, random_state=42):
+        if XGBRegressor is None:
+            raise ImportError("xgboost not installed")
+        self.model = XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,
+            learning_rate=0.1,
+        )
+        self.is_fitted = False
+
+    def prepare_features(self, ndvi, ndbi, ndwi, bsi):
+        X = np.column_stack([
+            ndvi.ravel(), ndbi.ravel(), ndwi.ravel(), bsi.ravel()
+        ])
+        valid = ~np.isnan(X).any(axis=1)
+        return X, valid
+
+    def fit(self, features_100m: Dict[str, np.ndarray], lst_100m: np.ndarray):
+        X, valid = self.prepare_features(**features_100m)
+        y = lst_100m.ravel()
+
+        X_clean = X[valid]
+        y_clean = y[valid]
+
+        target_valid = ~np.isnan(y_clean)
+        X_clean = X_clean[target_valid]
+        y_clean = y_clean[target_valid]
+
+        self.model.fit(X_clean, y_clean)
+        self.is_fitted = True
+        return self
+
+    def predict(self, features_10m: Dict[str, np.ndarray],
+                output_shape: Tuple[int, int]) -> np.ndarray:
+        X, valid = self.prepare_features(**features_10m)
+
+        lst_pred = np.full(X.shape[0], np.nan, dtype=np.float32)
+        lst_pred[valid] = self.model.predict(X[valid]).astype(np.float32)
+
+        return lst_pred.reshape(output_shape)
+
+
+def load_bands_from_geotiff(filepath: str):
+    if rasterio is None:
+        raise ImportError("rasterio not installed")
+
+    with rasterio.open(filepath) as src:
+        bands = {}
+        for i in range(1, src.count + 1):
+            name = src.descriptions[i-1] if src.descriptions[i-1] else f"band_{i}"
+            bands[name] = src.read(i).astype(np.float32)
+        meta = src.meta.copy()
+
+    return bands, meta
+
+
+def save_raster(data: np.ndarray, filepath: str, meta: dict):
+    if rasterio is None:
+        raise ImportError("rasterio not installed")
+
+    out_meta = meta.copy()
+    out_meta.update(count=1, dtype=data.dtype)
+
+    with rasterio.open(filepath, "w", **out_meta) as dst:
+        dst.write(data, 1)
+
+
+def run_index_computation(
+    s2_path: str,
+    thermal_path: str,
+    output_dir: Optional[str] = None,
+    sharpen: bool = True,
+) -> Dict[str, np.ndarray]:
+
+    out_dir = Path(output_dir) if output_dir else Path("output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    s2_bands, s2_meta = load_bands_from_geotiff(s2_path)
+
+    band_keys = list(s2_bands.keys())
+    logger.info(f"Loaded {len(band_keys)} bands: {band_keys}")
+
+    if len(band_keys) == 6:
+        b2  = s2_bands[band_keys[0]]
+        b3  = s2_bands[band_keys[1]]
+        b4  = s2_bands[band_keys[2]]
+        b8  = s2_bands[band_keys[3]]
+        # b8a = s2_bands[band_keys[4]]
+        b11 = s2_bands[band_keys[4]]
+        b12 = s2_bands[band_keys[5]]
     else:
-        logger.warning(f"Solver status: {solver.StatusName(status)}")
-        return _greedy_fallback(feasible_zones, T_max)
+        raise ValueError(f"Unexpected band count: {len(band_keys)}")
 
+    if any(x is None for x in [b2, b3, b4, b8, b11, b12]):
+        raise ValueError("Missing required bands")
 
-def _greedy_fallback(
-    zones: "gpd.GeoDataFrame",
-    max_trees: int,
-) -> Dict[str, Any]:
-    """
-    Greedy knapsack approximation when CP-SAT is unavailable.
-    Sort by TPIS density (TPIS / trees), select greedily.
-    """
-    logger.info("Using greedy fallback optimization")
+    results = {}
+    results["ndvi"] = compute_ndvi(b8, b4)
+    results["ndbi"] = compute_ndbi(b11, b8)
+    results["ndwi"] = compute_ndwi(b3, b8)
+    results["bsi"] = compute_bsi(b11, b4, b8, b2)
+    
+    # Also store raw bands for segmentation model (needs RGB: B4, B3, B2)
+    results["B2"] = b2   # Blue
+    results["B3"] = b3   # Green
+    results["B4"] = b4   # Red
+    results["B8"] = b8   # NIR
+    results["B11"] = b11  # SWIR
 
-    gdf = zones.reset_index(drop=True).copy()
-    trees = gdf["trees_possible"].values.astype(int)
-    tpis = gdf["tpis"].values
+    # Save only computed index rasters (not raw bands)
+    for name in ["ndvi", "ndbi", "ndwi", "bsi"]:
+        save_raster(results[name], str(out_dir / f"{name}.tif"), s2_meta)
 
-    # Value density = TPIS (already per-zone impact indicator)
-    density = tpis.copy()
-    order = np.argsort(-density)
+    thermal_bands, thermal_meta = load_bands_from_geotiff(thermal_path)
+    st_b10 = list(thermal_bands.values())[0]
 
-    selected = []
-    remaining_budget = max_trees
-    total_impact = 0
+    results["lst"] = compute_lst(st_b10, results["ndvi"])
+    save_raster(results["lst"], str(out_dir / "lst.tif"), thermal_meta)
 
-    for i in order:
-        if trees[i] <= remaining_budget and trees[i] > 0:
-            selected.append(int(i))
-            remaining_budget -= trees[i]
-            total_impact += tpis[i] * trees[i]
+    results["s2_meta"] = s2_meta
+    results["thermal_meta"] = thermal_meta
 
-    total_trees = max_trees - remaining_budget
-    gdf["selected"] = False
-    gdf.loc[selected, "selected"] = True
-
-    logger.info(f"Greedy: {len(selected)} zones, {total_trees} trees")
-    return {
-        "zones": gdf,
-        "selected_indices": selected,
-        "total_impact": total_impact,
-        "total_trees": total_trees,
-        "budget_utilization": total_trees / max(max_trees, 1) * 100,
-        "status": "GREEDY",
-    }
-
-
-def pareto_sweep(
-    feasible_zones: "gpd.GeoDataFrame",
-    max_budget: int = None,
-    step: int = None,
-) -> List[Dict[str, Any]]:
-    """
-    Pareto budget sweep for efficiency frontier.
-
-    Solves the knapsack for multiple budget levels to generate
-    (budget, total_impact, zones_selected) curve.
-
-    Args:
-        feasible_zones: GeoDataFrame of feasible zones.
-        max_budget: Maximum budget to sweep to.
-        step: Budget increment step.
-
-    Returns:
-        List of (budget, impact, zones_count) dicts.
-    """
-    max_b = max_budget or MAX_TREES
-    s = step or OPTIMIZER_PARAMS["pareto_step"]
-
-    logger.info(f"Running Pareto sweep: 0 → {max_b}, step={s}")
-
-    pareto_curve = []
-    for budget in range(s, max_b + 1, s):
-        result = knapsack_optimize(feasible_zones, max_trees=budget, timeout_sec=10)
-        pareto_curve.append({
-            "budget": budget,
-            "total_impact": result["total_impact"],
-            "zones_selected": len(result["selected_indices"]),
-            "total_trees": result["total_trees"],
-        })
-        logger.debug(f"  Budget={budget}: impact={result['total_impact']:.2f}, "
-                     f"zones={len(result['selected_indices'])}")
-
-    logger.info(f"Pareto sweep complete: {len(pareto_curve)} points")
-    return pareto_curve
-
-
-if __name__ == "__main__":
-    logger.info("Optimizer module loaded — run via pipeline_runner.py")
+    return results
